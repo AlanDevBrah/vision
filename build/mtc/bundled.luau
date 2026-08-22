@@ -1164,6 +1164,7 @@ local function raAttachFrame(frame)
     }
     reloadAssist.activeFrame = active
     reloadAssist.armed = true
+    reloadAssist.lastError = nil
 
     local sizeConn = parts.progress:GetPropertyChangedSignal("Size"):Connect(function()
         raEvaluate(active)
@@ -4386,7 +4387,7 @@ local function initialize()
             name = "Auto Quick Reload",
             hint = "Arms while waiting for the loader minigame; uses its own callback only after verification.",
 
-            forgetState = true,
+            flag = "V3ReloadAssist",
             value = false,
             callback = function(value)
                 if owner.stopped then
@@ -4400,6 +4401,12 @@ local function initialize()
                             pcall(function()
                                 element:Set(false, true)
                             end)
+
+                            if owner.window and type(owner.window.Save) == "function" then
+                                pcall(function()
+                                    owner.window:Save()
+                                end)
+                            end
                         end
                         notify({
                             title = "Quick Reload Assist",
