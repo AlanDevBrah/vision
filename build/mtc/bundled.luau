@@ -184,6 +184,12 @@ local cfg = {
     freecamMode = "scout",
     freecamSpeed = 60,
     freecamFov = 70,
+
+    perfPostFxOff = false,
+    perfPbrStrip = false,
+    perfQualityOn = false,
+    perfQualityLevel = 1,
+    perfOverlay = false,
 }
 
 local COLOR_ENEMY = Color3.fromRGB(255, 0, 0)
@@ -499,6 +505,14 @@ local function stop(reason)
             reloadController.stop()
         end)
     end
+
+    local perfClean = true
+    local perfController = rawget(owner, "performance")
+    if type(perfController) == "table" and type(perfController.restoreAll) == "function" then
+        perfClean = pcall(function()
+            perfController.restoreAll()
+        end)
+    end
     local mouseAimClean = true
     if mouseAim.unlocked or mouseAim.soloSet then
         local ok = pcall(disableMouseAim)
@@ -564,6 +578,7 @@ local function stop(reason)
     local clean = freecamClean
         and mouseAimClean
         and reloadAssistClean
+        and perfClean
         and connectionsClean
         and visualsClean
         and windowClean
@@ -1400,6 +1415,469 @@ function reloadAssist.stop()
 end
 
 owner.reloadAssist = reloadAssist
+
+local performance = {
+    lastError = nil,
+
+    pbrApplied = false,
+    postFxApplied = false,
+    qualityApplied = false,
+    overlayOn = false,
+
+    pbrBusy = false,
+
+    pbrCache = {},
+    fxCache = {},
+    atmosphereSaved = {},
+    shadowsSaved = nil,
+    qualitySaved = nil,
+    watchers = {},
+
+    overlayGui = nil,
+    overlayLabel = nil,
+    overlayConn = nil,
+    overlayFrames = 0,
+    overlayAccum = 0,
+}
+
+function performance.note(err)
+    performance.lastError = err
+end
+
+function performance.captureAndBlank(sa)
+    return pcall(function()
+        if performance.pbrCache[sa] == nil then
+            performance.pbrCache[sa] = {
+                color = sa.ColorMap,
+                metalness = sa.MetalnessMap,
+                normal = sa.NormalMap,
+                roughness = sa.RoughnessMap,
+            }
+        end
+        sa.ColorMap = ""
+        sa.MetalnessMap = ""
+        sa.NormalMap = ""
+        sa.RoughnessMap = ""
+    end)
+end
+
+function performance.pruneDeadPbr()
+    for sa, maps in pairs(performance.pbrCache) do
+        local alive = true
+        pcall(function()
+            alive = sa.Parent ~= nil
+        end)
+        if not alive then
+            performance.pbrCache[sa] = nil
+            _ = maps
+        end
+    end
+end
+
+function performance.startWatchers()
+    if performance.watchers.running then
+        return
+    end
+    performance.watchers.running = true
+
+    performance.watchers.descendant = game:GetService("Workspace").DescendantAdded:Connect(function(inst)
+        if not performance.pbrApplied then
+            return
+        end
+        local isSa = false
+        pcall(function()
+            isSa = inst:IsA("SurfaceAppearance")
+        end)
+        if not isSa then
+            return
+        end
+        task.defer(function()
+            if owner.stopped or not performance.pbrApplied then
+                return
+            end
+            performance.captureAndBlank(inst)
+        end)
+    end)
+    table.insert(owner.connections, performance.watchers.descendant)
+
+    performance.watchers.lighting = game:GetService("Lighting").ChildAdded:Connect(function(inst)
+        if not performance.postFxApplied then
+            return
+        end
+        task.defer(function()
+            if owner.stopped or not performance.postFxApplied then
+                return
+            end
+            local kind = nil
+            pcall(function()
+                if inst:IsA("PostEffect") then
+                    kind = "fx"
+                end
+                if inst:IsA("Atmosphere") then
+                    kind = "atmosphere"
+                end
+            end)
+            if kind == "fx" then
+                pcall(function()
+                    if performance.fxCache[inst] == nil then
+                        performance.fxCache[inst] = inst.Enabled
+                    end
+                    inst.Enabled = false
+                end)
+            elseif kind == "atmosphere" then
+                pcall(function()
+                    if not table.find(performance.atmosphereSaved, inst) then
+                        table.insert(performance.atmosphereSaved, inst)
+                    end
+                    inst.Parent = nil
+                end)
+            end
+        end)
+    end)
+    table.insert(owner.connections, performance.watchers.lighting)
+end
+
+function performance.stopWatchers()
+    for key, conn in pairs(performance.watchers) do
+        if key == "running" then
+            performance.watchers[key] = nil
+        else
+            pcall(function()
+                if conn.Connected then
+                    conn:Disconnect()
+                end
+            end)
+            for i = #owner.connections, 1, -1 do
+                if owner.connections[i] == conn then
+                    table.remove(owner.connections, i)
+                end
+            end
+            performance.watchers[key] = nil
+        end
+    end
+end
+
+function performance.applyPbr()
+    if performance.pbrBusy then
+        performance.note("pbr-scan-in-progress")
+        return false
+    end
+    if performance.pbrApplied then
+        return true
+    end
+    performance.lastError = nil
+    performance.pbrBusy = true
+    performance.pbrApplied = true
+
+    local descendants = game:GetService("Workspace"):GetDescendants()
+    local stepped = 0
+    for _, inst in ipairs(descendants) do
+        if not performance.pbrApplied or owner.stopped then
+            break
+        end
+        local isSa = false
+        pcall(function()
+            isSa = inst:IsA("SurfaceAppearance")
+        end)
+        if isSa then
+            performance.captureAndBlank(inst)
+        end
+        stepped += 1
+        if stepped % 2000 == 0 then
+            task.wait()
+            performance.pruneDeadPbr()
+        end
+    end
+    performance.pbrBusy = false
+    if not performance.pbrApplied or owner.stopped then
+
+        return performance.revertPbr(true)
+    end
+    performance.startWatchers()
+    return true
+end
+
+function performance.revertPbr(force)
+    if performance.pbrBusy and not force then
+
+        local waited = 0
+        while performance.pbrBusy and waited < 5 do
+            task.wait(0.1)
+            waited += 0.1
+        end
+        if performance.pbrBusy then
+            performance.note("pbr-scan-still-running")
+            return false
+        end
+    end
+    performance.pbrApplied = false
+    performance.pbrBusy = false
+    if not performance.pbrWatchNeeded() then
+        performance.stopWatchers()
+    end
+    local count = 0
+    for sa, maps in pairs(performance.pbrCache) do
+
+        pcall(function()
+            sa.ColorMap = maps.color
+            sa.MetalnessMap = maps.metalness
+            sa.NormalMap = maps.normal
+            sa.RoughnessMap = maps.roughness
+        end)
+        performance.pbrCache[sa] = nil
+        count += 1
+        if count % 500 == 0 then
+            task.wait()
+        end
+    end
+    return true
+end
+
+function performance.applyPostFx()
+    if performance.postFxApplied then
+        return true
+    end
+    performance.lastError = nil
+    local failed = false
+    local lighting = game:GetService("Lighting")
+    for _, inst in ipairs(lighting:GetChildren()) do
+        local kind = nil
+        pcall(function()
+            if inst:IsA("PostEffect") then
+                kind = "fx"
+            end
+            if inst:IsA("Atmosphere") then
+                kind = "atmosphere"
+            end
+        end)
+        if kind == "fx" then
+            local ok = pcall(function()
+                if performance.fxCache[inst] == nil then
+                    performance.fxCache[inst] = inst.Enabled
+                end
+                inst.Enabled = false
+            end)
+            if not ok then
+                failed = true
+            end
+        elseif kind == "atmosphere" then
+
+            local ok = pcall(function()
+                if not table.find(performance.atmosphereSaved, inst) then
+                    table.insert(performance.atmosphereSaved, inst)
+                end
+                inst.Parent = nil
+            end)
+            if not ok then
+                failed = true
+            end
+        end
+    end
+    if failed then
+        performance.note("postfx-apply-partial")
+        return false
+    end
+    performance.postFxApplied = true
+    performance.startWatchers()
+    return true
+end
+
+function performance.revertPostFx()
+    performance.postFxApplied = false
+    if not performance.pbrWatchNeeded() then
+        performance.stopWatchers()
+    end
+    for inst, enabled in pairs(performance.fxCache) do
+        pcall(function()
+            inst.Enabled = enabled
+        end)
+        performance.fxCache[inst] = nil
+    end
+    for _, atm in ipairs(performance.atmosphereSaved) do
+        pcall(function()
+            atm.Parent = game:GetService("Lighting")
+        end)
+    end
+    table.clear(performance.atmosphereSaved)
+    return true
+end
+
+function performance.applyQuality(level)
+    local n = math.clamp(math.floor(tonumber(level) or 1), 1, 10)
+    local item = nil
+    local enumOk = pcall(function()
+        item = Enum.SavedQualitySetting["QualityLevel" .. tostring(n)]
+    end)
+
+    if not enumOk or typeof(item) ~= "EnumItem" then
+        performance.note("quality-level-invalid")
+        return false
+    end
+    local ugsOk, ugs = pcall(function()
+        return UserSettings():GetService("UserGameSettings")
+    end)
+    if not ugsOk or typeof(ugs) ~= "Instance" then
+        performance.note("usersettings-unavailable")
+        return false
+    end
+    local ok = pcall(function()
+        if performance.qualitySaved == nil then
+            performance.qualitySaved = ugs.SavedQualityLevel
+        end
+        ugs.SavedQualityLevel = item
+    end)
+    if not ok then
+        performance.note("quality-write-failed")
+        return false
+    end
+    performance.qualityApplied = true
+    return true
+end
+
+function performance.revertQuality()
+    if performance.qualitySaved == nil then
+        performance.qualityApplied = false
+        return true
+    end
+    local ok = pcall(function()
+        UserSettings():GetService("UserGameSettings").SavedQualityLevel = performance.qualitySaved
+    end)
+    performance.qualitySaved = nil
+    performance.qualityApplied = false
+    if not ok then
+        performance.note("quality-restore-failed")
+        return false
+    end
+    return true
+end
+
+function performance.overlayStartLoop()
+    if performance.overlayConn then
+        return
+    end
+    performance.overlayFrames = 0
+    performance.overlayAccum = 0
+    performance.overlayConn = game:GetService("RunService").RenderStepped:Connect(function(delta)
+        performance.overlayFrames += 1
+        performance.overlayAccum += delta
+        if performance.overlayAccum >= 0.25 then
+            local fps = performance.overlayFrames / performance.overlayAccum
+            local ms = performance.overlayAccum / performance.overlayFrames * 1000
+            performance.overlayAccum = 0
+            performance.overlayFrames = 0
+            if performance.overlayLabel then
+                pcall(function()
+                    performance.overlayLabel.Text = string.format("%d FPS | %.1f ms", math.floor(fps + 0.5), ms)
+                end)
+            end
+        end
+    end)
+    table.insert(owner.connections, performance.overlayConn)
+end
+
+function performance.overlayStopLoop()
+    local conn = performance.overlayConn
+    performance.overlayConn = nil
+    if conn then
+        pcall(function()
+            if conn.Connected then
+                conn:Disconnect()
+            end
+        end)
+        for i = #owner.connections, 1, -1 do
+            if owner.connections[i] == conn then
+                table.remove(owner.connections, i)
+            end
+        end
+    end
+end
+
+function performance.overlaySet(on)
+    performance.lastError = nil
+    if on then
+        if not performance.overlayGui or not performance.overlayGui.Parent then
+            local ok = pcall(function()
+                local gui = Instance.new("ScreenGui")
+                gui.Name = "VisionPerfOverlay"
+                gui:SetAttribute("VisionOwner", ownerToken)
+                gui.DisplayOrder = 9000
+                gui.ResetOnSpawn = false
+                local label = Instance.new("TextLabel")
+                label.Name = "Readout"
+                label.BackgroundColor3 = Color3.fromRGB(10, 10, 12)
+                label.BackgroundTransparency = 0.4
+                label.BorderSizePixel = 0
+                label.Position = UDim2.fromOffset(8, 8)
+                label.Size = UDim2.fromOffset(0, 0)
+                label.AutomaticSize = Enum.AutomaticSize.XY
+                label.Font = Enum.Font.Code
+                label.TextSize = 14
+                label.TextColor3 = Color3.fromRGB(235, 235, 235)
+                label.TextXAlignment = Enum.TextXAlignment.Left
+                label.TextYAlignment = Enum.TextYAlignment.Top
+                label.Text = "-- FPS"
+                local pad = Instance.new("UIPadding")
+                pad.PaddingLeft = UDim.new(0, 6)
+                pad.PaddingTop = UDim.new(0, 3)
+                pad.PaddingRight = UDim.new(0, 6)
+                pad.PaddingBottom = UDim.new(0, 3)
+                pad.Parent = label
+                local corner = Instance.new("UICorner")
+                corner.CornerRadius = UDim.new(0, 6)
+                corner.Parent = label
+                label.Parent = gui
+                gui.Parent = game:GetService("CoreGui")
+                performance.overlayGui = gui
+                performance.overlayLabel = label
+            end)
+            if not ok then
+                performance.note("overlay-create-failed")
+                return false
+            end
+        else
+            performance.overlayGui.Enabled = true
+        end
+        performance.overlayOn = true
+        performance.overlayStartLoop()
+        return true
+    end
+    performance.overlayStopLoop()
+    local gui = performance.overlayGui
+    performance.overlayGui = nil
+    performance.overlayLabel = nil
+    performance.overlayOn = false
+    if gui then
+        pcall(function()
+            gui:Destroy()
+        end)
+    end
+    return true
+end
+
+function performance.pbrWatchNeeded()
+    return performance.pbrApplied or performance.postFxApplied
+end
+
+function performance.restoreAll()
+
+    performance.stopWatchers()
+    local clean = true
+    if not performance.revertPbr(true) then
+        clean = false
+    end
+    if not performance.revertPostFx() then
+        clean = false
+    end
+    if not performance.revertQuality() then
+        clean = false
+    end
+    if not performance.overlaySet(false) then
+        clean = false
+    end
+    return clean
+end
+
+owner.performance = performance
 local runtimeEnvironment = getfenv()
 local liveState = rawget(runtimeEnvironment, "STATE")
 
@@ -2669,6 +3147,11 @@ do
     end
 end
 
+function PenCheck.getBlastPen(shell)
+    local explosiveMass = shell.ExplosiveMass or 0
+    return 0.3183098861837907 * math.sqrt(2 * 1.2 * explosiveMass) * 40
+end
+
 local function penRetention(distanceStuds, shell)
     if GlobalConstants then
         return GlobalConstants.PenLoss(distanceStuds, shell)
@@ -2783,14 +3266,19 @@ local function ricochetCheck(shell, angleDeg, impactSpeed, flatArmor)
     if shell.ShellType == "AP" then
         velScale = math.min(AP_RICO_VEL_SCALE * (impactSpeed * STUD_TO_M) + AP_RICO_VEL_OFFSET, 1)
     end
-    local effRico = ricoAngle * velScale
 
     if velScale < 1 then
+
         if angleDeg >= ricoAngle then
             return "yes", 1
         end
+        local effRico = ricoAngle * velScale
         if angleDeg >= effRico then
-            return isApfsds(shell) and "no" or "risk", 1
+            if isApfsds(shell) then
+                return "no", 1
+            end
+            local odds = (angleDeg - effRico) / math.max(ricoAngle - effRico, 0.001)
+            return "risk", odds, "odds"
         end
         return "no", 1
     end
@@ -2804,7 +3292,7 @@ local function ricochetCheck(shell, angleDeg, impactSpeed, flatArmor)
         local band = (90 - ricoAngle) * math.clamp(flatArmor / shell.Diameter, 0, 1) ^ 2
         if steepness < band then
             local retention = math.clamp((band - steepness) / band * 1.934, 0.25, 0.9)
-            return "risk", retention
+            return "risk", retention, "retention"
         end
     end
     return "no", 1
@@ -2830,6 +3318,10 @@ PenCheck.evaluate = function(shell, hit)
 
     local effPen, penAtRange = effectivePen(shell, hit.distanceStuds or 0, angleDeg, los)
 
+    if hit.penCarry and hit.penCarry ~= 1 then
+        effPen *= hit.penCarry
+    end
+
     if shell.ShellType == "HEAT" then
         local av = hit.part.Parent and hit.part.Parent:FindFirstChild("ArmourValue")
         local slat = av and av:GetAttribute("SlatArmour") or 0
@@ -2840,14 +3332,21 @@ PenCheck.evaluate = function(shell, hit)
         effPen = effPen * math.clamp(1 - slat, 0, 1)
     end
 
-    local rico, retention = ricochetCheck(shell, angleDeg, hit.speed or 0, flatArmor or 0)
+    if shell.SAPHE and effPen < los then
+        effPen = math.max(effPen, PenCheck.getBlastPen(shell) / cos)
+    end
+
+    local rico, ricoVal, ricoKind = ricochetCheck(shell, angleDeg, hit.speed or 0, flatArmor or 0)
 
     local verdict
     if rico == "yes" then
         verdict = "RICOCHET"
+    elseif rico == "risk" and ricoKind == "odds" then
+
+        verdict = (effPen >= los) and "PEN_ODDS" or "RICOCHET_RISK"
     elseif rico == "risk" then
         verdict = "RICOCHET_RISK"
-        effPen = effPen * retention
+        effPen = effPen * ricoVal
     elseif effPen >= los then
         verdict = "PEN"
     else
@@ -2865,6 +3364,7 @@ PenCheck.evaluate = function(shell, hit)
         composite = composite,
         shellType = shell.ShellType,
         apfsds = isApfsds(shell),
+        ricoChance = (ricoKind == "odds") and ricoVal or nil,
     }
 end
 
@@ -3155,13 +3655,15 @@ resolveVehicleMuzzleAndShell = function(vehicle)
     return resolved
 end
 
-local function simulateTrajectory(origin, direction, speed, ricochetAngleDeg, excludeInstances)
+local function simulateTrajectory(origin, direction, speed, ricochetAngleDeg, excludeInstances, shellData)
     local positions = { origin }
     local pos = origin
     local vel = direction.Unit * speed
     local bounces = 0
     local traveled = 0
     local impact = nil
+
+    local penCarry = 1
     local params = RaycastParams.new()
     params.FilterType = Enum.RaycastFilterType.Exclude
 
@@ -3195,6 +3697,7 @@ local function simulateTrajectory(origin, direction, speed, ricochetAngleDeg, ex
                 distanceStuds = traveled,
                 speed = vel.Magnitude,
                 direction = vel.Unit,
+                penCarry = penCarry,
             }
             if bounces >= BC.MAX_RICOCHETS then
                 break
@@ -3203,6 +3706,16 @@ local function simulateTrajectory(origin, direction, speed, ricochetAngleDeg, ex
             local dot = math.clamp(vel.Unit:Dot(-result.Normal), -1, 1)
             local angleDeg = math.deg(math.acos(dot)) * BC.RICOCHET_ANGLE_SCALE
             if ricochetAngleDeg <= angleDeg then
+
+                if shellData and tostring(shellData.DisplayType or ""):find("APFSDS") == nil then
+                    local terrainHit = result.Instance == Workspace.Terrain
+                        or (string.find(result.Instance.Name, "Rock") ~= nil
+                            and not (result.Instance.Parent and result.Instance.Parent:FindFirstChild("ArmourValue")))
+                    if terrainHit then
+                        local ra = ricochetAngleDeg or 90
+                        penCarry *= math.min((((angleDeg - ra) / math.max(90 - ra, 1)) ^ 2 + 0.25) * 0.8, 1)
+                    end
+                end
                 local reflected = vel - 2 * vel:Dot(result.Normal) * result.Normal
 
                 local grazing = math.clamp((angleDeg - ricochetAngleDeg) / math.max(90 - ricochetAngleDeg, 1), 0, 1)
@@ -3452,7 +3965,7 @@ local function processBulletLines(_origin, localVehicle, vehicleCache)
         if char then table.insert(exclude, char) end
         if localVehicle then table.insert(exclude, localVehicle) end
     end)
-    local positions, impact = simulateTrajectory(muzzlePos, muzzleDir, speed, ricochetAngle, exclude)
+    local positions, impact = simulateTrajectory(muzzlePos, muzzleDir, speed, ricochetAngle, exclude, resolved.shellData)
     BS.BulletLastMuzzlePos = muzzlePos
     BS.BulletLastMuzzleDir = muzzleDir
     BS.BulletLastSpeed = speed
@@ -3480,6 +3993,7 @@ local VERDICT_COLORS = {
     NO_PEN = Color3.fromRGB(255, 70, 70),
     RICOCHET = Color3.fromRGB(255, 200, 40),
     RICOCHET_RISK = Color3.fromRGB(255, 200, 40),
+    PEN_ODDS = Color3.fromRGB(255, 170, 40),
 }
 
 local VERDICT_TEXT = {
@@ -3487,6 +4001,7 @@ local VERDICT_TEXT = {
     NO_PEN = "NO PEN",
     RICOCHET = "RICOCHET",
     RICOCHET_RISK = "RICOCHET?",
+    PEN_ODDS = "PEN?",
 }
 
 local PEN_IMMUNE_ARMOR = 1e6
@@ -3514,7 +4029,7 @@ local function ensurePenIndicator()
 
     local gui = Instance.new("BillboardGui")
     gui.Size = UDim2.fromOffset(230, 62)
-    gui.StudsOffsetWorldSpace = Vector3.new(0, 2, 0)
+    gui.StudsOffsetWorldSpace = Vector3.new(0, 1, 0)
     gui.AlwaysOnTop = true
     gui.LightInfluence = 0
     gui.ResetOnSpawn = false
@@ -3533,7 +4048,7 @@ local function ensurePenIndicator()
 
     local body = Instance.new("TextLabel")
     body.Name = "Details"
-    body.Size = UDim2.new(1, 0, 0, 36)
+    body.Size = UDim2.new(1, 0, 0, 50)
     body.Position = UDim2.new(0, 0, 0, 24)
     body.BackgroundTransparency = 1
     body.Font = Enum.Font.Gotham
@@ -3565,6 +4080,9 @@ local function showPenIndicator(position, result)
     PS.Part.CFrame = CFrame.new(position)
 
     local verdictText = VERDICT_TEXT[result.verdict] or tostring(result.verdict)
+    if result.ricoChance then
+        verdictText = string.format("PEN? %d%%", math.floor(result.ricoChance * 100 + 0.5))
+    end
 
     local armorText
     if result.armor >= PEN_IMMUNE_ARMOR then
@@ -3591,6 +4109,25 @@ local function showPenIndicator(position, result)
     end
     PS.Gui.Enabled = true
     PS.Visible = true
+end
+
+showBlocked = function(position)
+    ensurePenIndicator()
+    PS.Part.CFrame = CFrame.new(position)
+    if PS.LastText ~= "__BLOCKED__" then
+        PS.TitleLabel.Text = "BLOCKED"
+        PS.TitleLabel.TextColor3 = Color3.fromRGB(160, 160, 160)
+        PS.BodyLabel.Text = "shell stops on unarmored prop"
+        PS.LastText = "__BLOCKED__"
+    end
+    PS.Gui.Enabled = true
+    PS.Visible = true
+end
+
+function PS.displayPosition(hit)
+    local dist = hit.distanceStuds or 0
+    local lift = math.clamp(dist * 0.01, 0.75, 6)
+    return hit.position + Vector3.new(0, lift, 0)
 end
 
 local function evaluateAimRay(camera, localVehicle)
@@ -3632,6 +4169,20 @@ local function evaluateAimRay(camera, localVehicle)
     return resolved.shellData, hit
 end
 
+function PS.isUnarmoredProp(part)
+    if part == Workspace.Terrain then
+        return false
+    end
+    if part.Anchored then
+        return false
+    end
+    local parent = part.Parent
+    if not parent then
+        return true
+    end
+    return not (parent:FindFirstChild("ArmourValue") or parent:FindFirstChild("Humanoid"))
+end
+
 processPenIndicator = function(camera, localVehicle)
     if not cfg.penIndicator or not localVehicle then
         hidePenIndicator()
@@ -3650,13 +4201,18 @@ processPenIndicator = function(camera, localVehicle)
         return
     end
 
+    if PS.isUnarmoredProp(hit.part) then
+        showBlocked(PS.displayPosition(hit))
+        return
+    end
+
     local ok, result = pcall(PenCheck.evaluate, shell, hit)
     if not ok or not result then
 
         hidePenIndicator()
         return
     end
-    showPenIndicator(hit.position, result)
+    showPenIndicator(PS.displayPosition(hit), result)
 end
 local function processVehicleModel(
     vehicle,
@@ -4032,6 +4588,11 @@ owner.snapshot = function()
         reloadAssistAttempts = owner.reloadAssist.attempts,
         reloadAssistSuccessInvocations = owner.reloadAssist.successInvocations,
         reloadAssistLastError = owner.reloadAssist.lastError,
+        perfPbrApplied = performance.pbrApplied,
+        perfPostFxApplied = performance.postFxApplied,
+        perfQualityApplied = performance.qualityApplied,
+        perfOverlayOn = performance.overlayOn,
+        perfLastError = performance.lastError,
         playerWallcheck = cfg.playerWallcheck,
         playerTeamcheck = cfg.playerTeamcheck,
         vehicleWallcheck = cfg.vehicleWallcheck,
@@ -4858,6 +5419,113 @@ local function initialize()
             callback = function()
                 stop("ui-unload")
             end,
+        })
+    end)
+
+    ownedCall("performance-section", function()
+        return settingsTab:CreateSection({ name = "Performance" })
+    end)
+    local perfRow = ownedCall("performance-row", function()
+        return settingsTab:CreateGroup({ direction = "row" })
+    end)
+    local function perfFailed(context)
+        notify({
+            title = "Performance",
+            content = context .. " failed (" .. tostring(performance.lastError) .. ").",
+            duration = 5,
+            icon = "warning",
+        })
+    end
+
+    ownedCall("perf-postfx-toggle", function()
+        return perfRow:CreateToggle({
+            name = "Post FX Off",
+            hint = "Lighting post effects + Atmosphere haze off. Also clears distance haze.",
+            flag = "V3PerfPostFx",
+            value = cfg.perfPostFxOff,
+            callback = changed(function(value)
+                cfg.perfPostFxOff = value
+                local ok = value and performance.applyPostFx() or performance.revertPostFx()
+                if not ok then
+                    perfFailed(value and "Post FX Off" or "Post FX restore")
+                end
+            end),
+        })
+    end)
+    ownedCall("perf-pbr-toggle", function()
+        return settingsTab:CreateToggle({
+            name = "PBR Strip",
+            hint = "Blanks PBR surface texture maps (largest measured gain; shading only - no draw-distance change). Scan runs briefly in the background.",
+            flag = "V3PerfPbrStrip",
+            value = cfg.perfPbrStrip,
+            callback = function(value)
+                if owner.stopped then
+                    return
+                end
+                cfg.perfPbrStrip = value
+                task.spawn(function()
+                    if value then
+                        if not performance.applyPbr() then
+                            perfFailed("PBR Strip")
+                        end
+                    else
+                        if not performance.revertPbr(false) then
+                            perfFailed("PBR restore")
+                        end
+                    end
+                end)
+            end,
+        })
+    end)
+    ownedCall("perf-quality-toggle", function()
+        return settingsTab:CreateToggle({
+            name = "Force Render Quality",
+            hint = "Overrides the Roblox graphics quality level while ON (reduces distant mesh detail)",
+            flag = "V3PerfQualityOn",
+            value = cfg.perfQualityOn,
+            callback = changed(function(value)
+                cfg.perfQualityOn = value
+                local ok = value and performance.applyQuality(cfg.perfQualityLevel)
+                    or performance.revertQuality()
+                if not ok then
+                    perfFailed(value and "Render Quality override" or "Render Quality restore")
+                end
+            end),
+        })
+    end)
+    ownedCall("perf-quality-level", function()
+        return settingsTab:CreateSlider({
+            name = "Quality Level",
+            hint = "1 = fastest, 10 = automatic/full quality (21:9-safe auto resolution)",
+            range = { 1, 10 },
+            increment = 1,
+            value = cfg.perfQualityLevel,
+            suffix = "",
+            flag = "V3PerfQualityLevel",
+            callback = function(value)
+                if owner.stopped then
+                    return
+                end
+                cfg.perfQualityLevel = math.clamp(math.floor(value), 1, 10)
+
+                if cfg.perfQualityOn and not performance.applyQuality(cfg.perfQualityLevel) then
+                    perfFailed("Render Quality override")
+                end
+            end,
+        })
+    end)
+    ownedCall("perf-overlay-toggle", function()
+        return settingsTab:CreateToggle({
+            name = "FPS Overlay",
+            hint = "Small corner readout (FPS + frame time)",
+            flag = "V3PerfOverlay",
+            value = cfg.perfOverlay,
+            callback = changed(function(value)
+                cfg.perfOverlay = value
+                if not performance.overlaySet(value) then
+                    perfFailed(value and "FPS Overlay" or "FPS Overlay removal")
+                end
+            end),
         })
     end)
 
