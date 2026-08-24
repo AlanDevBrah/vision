@@ -521,6 +521,14 @@ local function stop(reason)
             infantryController.clearCache()
         end)
     end
+
+    local fpvClean = true
+    local fpvController = rawget(owner, "fpv")
+    if type(fpvController) == "table" and type(fpvController.stop) == "function" then
+        fpvClean = pcall(function()
+            fpvController.stop()
+        end)
+    end
     local mouseAimClean = true
     if mouseAim.unlocked or mouseAim.soloSet then
         local ok = pcall(disableMouseAim)
@@ -555,7 +563,7 @@ local function stop(reason)
     end
 
     if owner.cleanupComplete then
-        return mouseAimClean and reloadAssistClean
+        return mouseAimClean and reloadAssistClean and fpvClean
     end
     if owner.cleanupRunning then
         owner.cleanupPending = true
@@ -588,6 +596,7 @@ local function stop(reason)
         and reloadAssistClean
         and perfClean
         and infantryClean
+        and fpvClean
         and connectionsClean
         and visualsClean
         and windowClean
@@ -1424,6 +1433,491 @@ function reloadAssist.stop()
 end
 
 owner.reloadAssist = reloadAssist
+owner.fpv = {
+
+    enabled = false,
+    supported = false,
+    stateTablesFound = false,
+    signalBypass = false,
+    batteryBypass = false,
+    spawnBypass = false,
+
+    attempts = 0,
+    detonateFires = 0,
+    detonateMisses = 0,
+    rescans = 0,
+    lastErrorCount = 0,
+    lastError = nil,
+
+    manager = nil,
+    dronesModule = nil,
+    origLinkOk = nil,
+    origTwitchSeverity = nil,
+    origPowerMult = nil,
+    sessions = nil,
+    droneStates = nil,
+    swapsInstalled = false,
+    rescanAccumulator = 0,
+    heartbeat = nil,
+    postOsdBound = false,
+    renderBindName = "VisionFPVPostOSD",
+}
+
+function owner.fpv.noteError(msg)
+    local fpv = owner.fpv
+    fpv.lastErrorCount += 1
+    fpv.lastError = msg
+end
+
+function owner.fpv.resolveModules()
+    local fpv = owner.fpv
+    if fpv.manager then
+        return true
+    end
+    local ok, err = pcall(function()
+        local replicatedStorage = game:GetService("ReplicatedStorage")
+        local tankModules = replicatedStorage:FindFirstChild("TankModules")
+        local dronesFolder = tankModules and tankModules:FindFirstChild("Drones")
+        local managerModule = dronesFolder and dronesFolder:FindFirstChild("FPVManager")
+        if not managerModule then
+            error("modules-not-found")
+        end
+        local m = require(managerModule)
+        if typeof(m) ~= "table" or typeof(m.SetLinkOk) ~= "function"
+            or typeof(m.SetTwitchSeverity) ~= "function"
+            or typeof(m.SetPowerMult) ~= "function" then
+            error("modules-not-found")
+        end
+
+        local d = require(dronesFolder)
+        if typeof(d) ~= "table" then
+            error("modules-not-found")
+        end
+
+        fpv.origLinkOk = m.SetLinkOk
+        fpv.origTwitchSeverity = m.SetTwitchSeverity
+        fpv.origPowerMult = m.SetPowerMult
+        fpv.manager = m
+        fpv.dronesModule = d
+    end)
+    if not ok then
+        fpv.supported = false
+        fpv.lastError = "modules-not-found"
+        return false
+    end
+    fpv.supported = true
+    return true
+end
+
+function owner.fpv.scanSessions(fn)
+    if typeof(fn) ~= "function" then
+        return nil
+    end
+    for i = 1, 12 do
+        local ok, val = pcall(debug.getupvalue, fn, i)
+        if not ok then
+            break
+        end
+        if typeof(val) == "table" then
+            local _, sample = next(val)
+            if typeof(sample) == "table" and sample.drone ~= nil and sample.linkOk ~= nil then
+                return val
+            end
+        end
+    end
+    return nil
+end
+
+function owner.fpv.scanStatesWalk(t, seen, depth)
+    if depth > 4 or seen[t] then
+        return nil
+    end
+    seen[t] = true
+    for _, v in pairs(t) do
+        if typeof(v) == "function" then
+            for i = 1, 30 do
+                local ok, upv = pcall(debug.getupvalue, v, i)
+                if not ok then
+                    break
+                end
+                if typeof(upv) == "table" then
+                    local _, sample = next(upv)
+                    if typeof(sample) == "table"
+                        and sample.mAhSpent ~= nil
+                        and sample.jamUplinkWatts ~= nil
+                        and sample.grain ~= nil then
+                        return upv
+                    end
+                end
+            end
+        elseif typeof(v) == "table" then
+            local found = owner.fpv.scanStatesWalk(v, seen, depth + 1)
+            if found then
+                return found
+            end
+        end
+    end
+    return nil
+end
+
+function owner.fpv.scanDroneStates()
+    local fpv = owner.fpv
+    if typeof(fpv.dronesModule) ~= "table" then
+        return nil
+    end
+    return owner.fpv.scanStatesWalk(fpv.dronesModule, {}, 0)
+end
+
+function owner.fpv.rescanTables()
+    local fpv = owner.fpv
+    if not fpv.sessions and fpv.origLinkOk then
+        fpv.sessions = owner.fpv.scanSessions(fpv.origLinkOk)
+    end
+    if not fpv.droneStates and fpv.dronesModule then
+        fpv.droneStates = owner.fpv.scanDroneStates()
+    end
+    fpv.rescans += 1
+    fpv.stateTablesFound = fpv.sessions ~= nil and fpv.droneStates ~= nil
+    return fpv.stateTablesFound
+end
+
+function owner.fpv.installSwaps()
+    local fpv = owner.fpv
+    if fpv.swapsInstalled or not fpv.manager then
+        return
+    end
+    local ok1 = pcall(function()
+        fpv.manager.SetLinkOk = function(vehicle, _ok)
+            fpv.origLinkOk(vehicle, true)
+        end
+    end)
+    local ok2 = pcall(function()
+        fpv.manager.SetTwitchSeverity = function(vehicle, _severity)
+            fpv.origTwitchSeverity(vehicle, 0)
+        end
+    end)
+    local ok3 = pcall(function()
+        fpv.manager.SetPowerMult = function(vehicle, _mult)
+            fpv.origPowerMult(vehicle, 1)
+        end
+    end)
+    fpv.swapsInstalled = ok1 and ok2 and ok3
+    if not fpv.swapsInstalled then
+        owner.fpv.noteError("swap-install-partial")
+        owner.fpv.restoreSwaps(true)
+    end
+end
+
+function owner.fpv.restoreSwaps(force)
+    local fpv = owner.fpv
+    if not fpv.manager or (not fpv.swapsInstalled and not force) then
+        fpv.swapsInstalled = false
+        return
+    end
+    pcall(function()
+        fpv.manager.SetLinkOk = fpv.origLinkOk
+    end)
+    pcall(function()
+        fpv.manager.SetTwitchSeverity = fpv.origTwitchSeverity
+    end)
+    pcall(function()
+        fpv.manager.SetPowerMult = fpv.origPowerMult
+    end)
+    fpv.swapsInstalled = false
+end
+
+function owner.fpv.syncSwaps()
+    local fpv = owner.fpv
+    local want = fpv.enabled and (fpv.signalBypass or fpv.batteryBypass)
+    if want and not fpv.swapsInstalled then
+        owner.fpv.installSwaps()
+    elseif not want and fpv.swapsInstalled then
+        owner.fpv.restoreSwaps()
+    end
+end
+
+function owner.fpv.setGate(name, value)
+    local fpv = owner.fpv
+    if name ~= "signalBypass" and name ~= "batteryBypass" and name ~= "spawnBypass" then
+        return false
+    end
+    fpv[name] = value == true
+    owner.fpv.syncSwaps()
+    return true
+end
+
+function owner.fpv.applyOverrides()
+    local fpv = owner.fpv
+
+    if not fpv.enabled then
+        return
+    end
+    if not fpv.sessions or not fpv.droneStates then
+        return
+    end
+    if not (fpv.signalBypass or fpv.batteryBypass or fpv.spawnBypass) then
+        return
+    end
+    for vehicle, session in pairs(fpv.sessions) do
+        local ok, err = pcall(function()
+            local drone = session.drone
+            if not (drone and drone.Part and drone.Part.Parent) then
+                return
+            end
+            local st = fpv.droneStates[vehicle]
+            if st then
+                if fpv.signalBypass then
+                    st.jamUplinkWatts = 0
+                    st.jamDownlinkWatts = 0
+                    st.smoothedWallLoss = 0
+                    st.losWallDbmLoss = 0
+                    st.spawnProximityDbm = 0
+                    if st.grain then
+                        st.grain.ImageTransparency = 1
+                    end
+                    if st.black then
+                        st.black.Visible = false
+                    end
+                elseif fpv.spawnBypass then
+                    st.spawnProximityDbm = 0
+                end
+                if fpv.batteryBypass then
+                    st.mAhSpent = 0
+                    st.currentAmps = 2
+                end
+            end
+
+            if not fpv.swapsInstalled then
+                if fpv.signalBypass then
+                    pcall(fpv.origLinkOk, vehicle, true)
+                    pcall(fpv.origTwitchSeverity, vehicle, 0)
+                end
+                if fpv.batteryBypass then
+                    pcall(fpv.origPowerMult, vehicle, 1)
+                end
+            end
+        end)
+        if not ok then
+            owner.fpv.noteError(tostring(err))
+        end
+    end
+end
+
+function owner.fpv.postOsd()
+    local fpv = owner.fpv
+    if not fpv.enabled or not fpv.signalBypass then
+        return
+    end
+    pcall(function()
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local controlGui = pg and pg:FindFirstChild("ControlGUI")
+        if controlGui then
+            local grain = controlGui:FindFirstChild("Grain")
+            if grain and grain:IsA("ImageLabel") then
+                grain.ImageTransparency = 1
+                grain.Visible = false
+            end
+            local black = controlGui:FindFirstChild("Black")
+            if black and black:IsA("GuiObject") then
+                black.Visible = false
+            end
+        end
+    end)
+
+    if fpv.sessions and fpv.origLinkOk then
+        for vehicle, session in pairs(fpv.sessions) do
+            pcall(function()
+                local drone = session.drone
+                if drone and drone.Part and drone.Part.Parent then
+                    pcall(fpv.origLinkOk, vehicle, true)
+                    if fpv.origTwitchSeverity then
+                        pcall(fpv.origTwitchSeverity, vehicle, 0)
+                    end
+                end
+            end)
+        end
+    end
+end
+
+function owner.fpv.start()
+    local fpv = owner.fpv
+    if fpv.enabled then
+        return true
+    end
+    if not owner.fpv.resolveModules() then
+        return false
+    end
+    owner.fpv.rescanTables()
+
+    if not fpv.postOsdBound then
+        local bound = pcall(function()
+            RunService:BindToRenderStep(
+                fpv.renderBindName,
+                Enum.RenderPriority.Camera.Value + 2,
+                function()
+                    owner.fpv.postOsd()
+                end
+            )
+        end)
+        fpv.postOsdBound = bound
+    end
+
+    if not fpv.heartbeat or not fpv.heartbeat.Connected then
+        fpv.heartbeat = RunService.Heartbeat:Connect(function(dt)
+            local f = owner.fpv
+            if not f.sessions or not f.droneStates then
+                f.rescanAccumulator += (dt or 0)
+                if f.rescanAccumulator >= 0.5 then
+                    f.rescanAccumulator = 0
+                    f.rescanTables()
+                end
+            end
+            f.applyOverrides()
+        end)
+        table.insert(owner.connections, fpv.heartbeat)
+    end
+
+    fpv.enabled = true
+    owner.fpv.syncSwaps()
+    return true
+end
+
+function owner.fpv.stop()
+    local fpv = owner.fpv
+    local wasActive = fpv.enabled or fpv.swapsInstalled or fpv.postOsdBound
+        or (fpv.heartbeat and fpv.heartbeat.Connected)
+    if not wasActive then
+        fpv.enabled = false
+        fpv.signalBypass = false
+        fpv.batteryBypass = false
+        fpv.spawnBypass = false
+        return true
+    end
+
+    owner.fpv.restoreSwaps(true)
+    if fpv.heartbeat then
+        pcall(function()
+            if fpv.heartbeat.Connected then
+                fpv.heartbeat:Disconnect()
+            end
+        end)
+        for i = #owner.connections, 1, -1 do
+            if owner.connections[i] == fpv.heartbeat then
+                table.remove(owner.connections, i)
+            end
+        end
+        fpv.heartbeat = nil
+    end
+    if fpv.postOsdBound then
+        pcall(function()
+            RunService:UnbindFromRenderStep(fpv.renderBindName)
+        end)
+        fpv.postOsdBound = false
+    end
+    fpv.signalBypass = false
+    fpv.batteryBypass = false
+    fpv.spawnBypass = false
+    fpv.enabled = false
+    return true
+end
+
+function owner.fpv.findOurFiredRemote()
+    local fpv = owner.fpv
+    local placed = Workspace:FindFirstChild("PlacedBuildings")
+    if not placed then
+        return nil, "no-placed-buildings"
+    end
+
+    local ourPart = nil
+    if fpv.sessions then
+        for _, session in pairs(fpv.sessions) do
+            local drone = session.drone
+            if drone and drone.Part and drone.Part.Parent then
+                ourPart = drone.Part
+                break
+            end
+        end
+    end
+
+    local ourControl = nil
+    pcall(function()
+        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+        local controlGui = pg and pg:FindFirstChild("ControlGUI")
+        local control = controlGui and controlGui:FindFirstChild("Control")
+        if control and control:IsA("ObjectValue") then
+            ourControl = control.Value
+        end
+    end)
+
+    if not ourPart and not ourControl then
+        return nil, "no-active-session"
+    end
+
+    local candidates = {}
+    for _, model in ipairs(placed:GetChildren()) do
+        if model.Name == "FPV Drone" then
+            local linked = false
+            if ourPart and ourPart:IsDescendantOf(model) then
+                linked = true
+            end
+            if not linked and ourControl and typeof(ourControl) == "Instance" then
+                if ourControl == model
+                    or ourControl:IsDescendantOf(model)
+                    or model:IsDescendantOf(ourControl) then
+                    linked = true
+                end
+            end
+            if linked then
+                local sc = model:FindFirstChildOfClass("Script")
+                local fired = sc and sc:FindFirstChild("Fired")
+                if fired and fired:IsA("RemoteEvent") then
+                    table.insert(candidates, fired)
+                end
+            end
+        end
+    end
+
+    if #candidates == 1 then
+        return candidates[1], nil
+    elseif #candidates == 0 then
+        return nil, "no-matching-drone"
+    end
+    return nil, "ambiguous-drone"
+end
+
+function owner.fpv.detonate()
+    local fpv = owner.fpv
+
+    if not fpv.manager and not owner.fpv.resolveModules() then
+        fpv.attempts += 1
+        fpv.detonateMisses += 1
+        fpv.lastError = "modules-not-found"
+        return false, "modules-not-found"
+    end
+    if not (fpv.sessions or owner.fpv.rescanTables()) then
+        fpv.attempts += 1
+        fpv.detonateMisses += 1
+        fpv.lastError = "no-active-session"
+        return false, "no-active-session"
+    end
+    fpv.attempts += 1
+    local fpvFiredRemote, reason = owner.fpv.findOurFiredRemote()
+    if not fpvFiredRemote then
+        fpv.detonateMisses += 1
+        fpv.lastError = reason
+        return false, reason
+    end
+    local ok, err = pcall(function()
+        fpvFiredRemote:FireServer()
+    end)
+    if ok then
+        fpv.detonateFires += 1
+        return true
+    end
+    fpv.detonateMisses += 1
+    fpv.lastError = tostring(err)
+    return false, fpv.lastError
+end
 
 local performance = {
     lastError = nil,
@@ -4837,6 +5331,15 @@ owner.snapshot = function()
         reloadAssistAttempts = owner.reloadAssist.attempts,
         reloadAssistSuccessInvocations = owner.reloadAssist.successInvocations,
         reloadAssistLastError = owner.reloadAssist.lastError,
+
+        fpvEnabled = owner.fpv.enabled,
+        fpvSupported = owner.fpv.supported,
+        fpvStateTablesFound = owner.fpv.stateTablesFound,
+        fpvSignalBypass = owner.fpv.signalBypass,
+        fpvBatteryBypass = owner.fpv.batteryBypass,
+        fpvSpawnBypass = owner.fpv.spawnBypass,
+        fpvDetonateFires = owner.fpv.detonateFires,
+        fpvLastError = owner.fpv.lastError,
         perfPbrApplied = performance.pbrApplied,
         perfPostFxApplied = performance.postFxApplied,
         perfQualityApplied = performance.qualityApplied,
@@ -5248,6 +5751,132 @@ local function initialize()
             end
         end
         return element
+    end)
+
+    ownedCall("drone-section", function()
+        return crewTab:CreateSection({ name = "Drone" })
+    end)
+
+    ownedCall("drone-master-toggle", function()
+        local element = nil
+        element = crewTab:CreateToggle({
+            name = "Drone Link Suite",
+            hint = "Arms the FPV assists below; verifies the game's drone systems first and stays OFF if they cannot be verified.",
+            flag = "V3FpvMaster",
+            value = false,
+            callback = function(value)
+                if owner.stopped then
+                    return
+                end
+                if value then
+                    local ok = owner.fpv.start()
+                    if not ok then
+                        if element and type(element.Set) == "function" then
+                            pcall(function()
+                                element:Set(false, true)
+                            end)
+                            if owner.window and type(owner.window.Save) == "function" then
+                                pcall(function()
+                                    owner.window:Save()
+                                end)
+                            end
+                        end
+                        notify({
+                            title = "Drone Link Suite",
+                            content = "Drone systems could not be verified (" .. tostring(owner.fpv.lastError) .. "). Stays OFF.",
+                            duration = 5,
+                            icon = "warning",
+                        })
+                    else
+                        notify({
+                            title = "Drone Link Suite ON",
+                            content = "FPV assists armed. Toggle individual assists below.",
+                            duration = 4,
+                            icon = "check",
+                        })
+                    end
+                else
+                    owner.fpv.stop()
+                    notify({
+                        title = "Drone Link Suite OFF",
+                        content = "Link functions restored to stock.",
+                        duration = 4,
+                        icon = "check",
+                    })
+                end
+            end,
+        })
+        return element
+    end)
+
+    ownedCall("drone-signal-toggle", function()
+        return crewTab:CreateToggle({
+            name = "Signal Bypass",
+            hint = "Holds the control link through jammers, wall loss, and blackout. Includes spawn-proximity immunity.",
+            flag = "V3FpvSignal",
+            value = false,
+            callback = function(value)
+                if owner.stopped then
+                    return
+                end
+                owner.fpv.setGate("signalBypass", value)
+            end,
+        })
+    end)
+
+    ownedCall("drone-battery-toggle", function()
+        return crewTab:CreateToggle({
+            name = "Battery Bypass",
+            hint = "Freezes battery drain and removes power derate while flying.",
+            flag = "V3FpvBattery",
+            value = false,
+            callback = function(value)
+                if owner.stopped then
+                    return
+                end
+                owner.fpv.setGate("batteryBypass", value)
+            end,
+        })
+    end)
+
+    ownedCall("drone-spawn-toggle", function()
+        return crewTab:CreateToggle({
+            name = "Spawn Protection Bypass",
+            hint = "Ignores the spawn-proximity link penalty. Redundant while Signal Bypass is on.",
+            flag = "V3FpvSpawn",
+            value = false,
+            callback = function(value)
+                if owner.stopped then
+                    return
+                end
+                owner.fpv.setGate("spawnBypass", value)
+            end,
+        })
+    end)
+
+    ownedCall("drone-detonate-button", function()
+        return crewTab:CreateButton({
+            name = "Force Detonate",
+            hint = "Detonates YOUR deployed FPV drone only; refuses when ownership is ambiguous.",
+            callback = function()
+                local ok, reason = owner.fpv.detonate()
+                if ok then
+                    notify({
+                        title = "Force Detonate",
+                        content = "Detonate signal sent.",
+                        duration = 4,
+                        icon = "check",
+                    })
+                else
+                    notify({
+                        title = "Force Detonate",
+                        content = "No owned drone resolved (" .. tostring(reason) .. "). Nothing fired.",
+                        duration = 5,
+                        icon = "warning",
+                    })
+                end
+            end,
+        })
     end)
 
     local freecamTab = ownedCall("freecam-tab", function()
