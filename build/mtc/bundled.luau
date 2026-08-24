@@ -513,6 +513,14 @@ local function stop(reason)
             perfController.restoreAll()
         end)
     end
+
+    local infantryClean = true
+    local infantryController = rawget(owner, "infantry")
+    if type(infantryController) == "table" and type(infantryController.clearCache) == "function" then
+        infantryClean = pcall(function()
+            infantryController.clearCache()
+        end)
+    end
     local mouseAimClean = true
     if mouseAim.unlocked or mouseAim.soloSet then
         local ok = pcall(disableMouseAim)
@@ -579,6 +587,7 @@ local function stop(reason)
         and mouseAimClean
         and reloadAssistClean
         and perfClean
+        and infantryClean
         and connectionsClean
         and visualsClean
         and windowClean
@@ -1431,7 +1440,7 @@ local performance = {
     atmosphereSaved = {},
     shadowsSaved = nil,
     qualitySaved = nil,
-    watchers = {},
+    watchers = { running = false },
 
     overlayGui = nil,
     overlayLabel = nil,
@@ -1721,10 +1730,11 @@ function performance.applyQuality(level)
         return false
     end
     local ok = pcall(function()
+
         if performance.qualitySaved == nil then
-            performance.qualitySaved = ugs.SavedQualityLevel
+            performance.qualitySaved = ugs["SavedQualityLevel"]
         end
-        ugs.SavedQualityLevel = item
+        ugs["SavedQualityLevel"] = item
     end)
     if not ok then
         performance.note("quality-write-failed")
@@ -1740,7 +1750,8 @@ function performance.revertQuality()
         return true
     end
     local ok = pcall(function()
-        UserSettings():GetService("UserGameSettings").SavedQualityLevel = performance.qualitySaved
+
+        UserSettings():GetService("UserGameSettings")["SavedQualityLevel"] = performance.qualitySaved
     end)
     performance.qualitySaved = nil
     performance.qualityApplied = false
@@ -3976,6 +3987,216 @@ local function processBulletLines(_origin, localVehicle, vehicleCache)
     renderOrHide(positions)
 end
 
+BS.Infantry = {
+
+    cache = {},
+    CACHE_TTL = 2.0,
+    NEG_TTL = 1.0,
+    shellsCache = nil,
+    MAX_AIM_DIST = 6000,
+    LINE_COLOR = BC.COLOR_BULLET,
+
+    lastTrajectory = nil,
+    lastImpact = nil,
+    lastShell = nil,
+    lastMuzzlePos = nil,
+    lastMuzzleDir = nil,
+    lastSpeed = nil,
+    lastAt = 0,
+    active = 0,
+}
+
+function BS.Infantry.shellModules()
+    if BS.Infantry.shellsCache ~= nil then
+        return BS.Infantry.shellsCache or nil
+    end
+    local ok, mod = pcall(function()
+        return (require :: any)(ReplicatedStorage:WaitForChild("PHRST"):WaitForChild("ShellModules"))
+    end)
+    if ok and type(mod) == "table" then
+        BS.Infantry.shellsCache = mod
+        return mod
+    end
+
+    BS.Infantry.shellsCache = false
+    return nil
+end
+
+function BS.Infantry.prune()
+    local now = os.clock()
+    for tool, hit in pairs(BS.Infantry.cache) do
+        local dead = typeof(tool) ~= "Instance" or tool.Parent == nil
+        local stale = now - (hit.at or 0) > ((hit.result == false) and BS.Infantry.NEG_TTL or BS.Infantry.CACHE_TTL)
+        if dead or stale then
+            BS.Infantry.cache[tool] = nil
+        end
+    end
+end
+
+function BS.Infantry.resolve(tool)
+    if not tool or not tool:IsA("Tool") then
+        return nil
+    end
+    local now = os.clock()
+    local hit = BS.Infantry.cache[tool]
+    if hit then
+        local ttl = (hit.result == false) and BS.Infantry.NEG_TTL or BS.Infantry.CACHE_TTL
+        if now - hit.at < ttl then
+            return hit.result or nil
+        end
+    end
+
+    local result = false
+    do
+        local settingsModule = tool:FindFirstChild("ACS_Settings")
+        local okAcs, acs = pcall(require, settingsModule)
+        if okAcs and type(acs) == "table" and type(acs.gunName) == "string" and acs.gunName ~= "" then
+            local shells = BS.Infantry.shellModules()
+            local entry = shells and shells["InfGuns:" .. acs.gunName]
+            if type(entry) == "table" and entry.ShellType and entry.MuzzleSpeed then
+                result = { entry = entry, acs = acs }
+            end
+        end
+    end
+
+    BS.Infantry.prune()
+    BS.Infantry.cache[tool] = { at = now, result = result }
+    return result or nil
+end
+
+function BS.Infantry.isLineClass(entry)
+    if type(entry) ~= "table" then
+        return false
+    end
+    if entry.OverrideProjectileModel ~= nil then
+        return true
+    end
+    local st = tostring(entry.ShellType or "")
+    return st == "HEAT" or st == "HE" or st == "SAPHE" or st == "APHE" or st == "HEATFS"
+end
+
+function BS.Infantry.muzzleCFrame(camera)
+    return camera.CFrame * CFrame.new(0.45, -0.45, -0.9)
+end
+
+function BS.Infantry.clearLine()
+    if BS.Infantry.active > 0 then
+        hideExcessBulletParts(1)
+    end
+    BS.Infantry.active = 0
+    BS.Infantry.lastTrajectory = nil
+    BS.Infantry.lastImpact = nil
+    BS.Infantry.lastShell = nil
+    BS.Infantry.lastMuzzlePos = nil
+    BS.Infantry.lastMuzzleDir = nil
+    BS.Infantry.lastSpeed = nil
+    BS.Infantry.lastAt = 0
+end
+
+function BS.Infantry.updateLine(camera, resolved, draw)
+    local muzzleCF = BS.Infantry.muzzleCFrame(camera)
+    local muzzlePos = muzzleCF.Position
+    local muzzleDir = camera.CFrame.LookVector
+    local speed = resolved.entry.MuzzleSpeed
+    local now = os.clock()
+
+    local canReuse = BS.Infantry.lastTrajectory ~= nil
+        and BS.Infantry.lastSpeed == speed
+        and (now - BS.Infantry.lastAt) < BC.TRAJECTORY_MAX_AGE
+        and BS.Infantry.lastMuzzlePos ~= nil
+        and (muzzlePos - BS.Infantry.lastMuzzlePos).Magnitude ^ 2 < BC.TRAJECTORY_EPS_SQ
+        and muzzleDir:Dot(BS.Infantry.lastMuzzleDir) > BC.TRAJECTORY_DOT
+    if not canReuse then
+        local exclude = {}
+        pcall(function()
+            local cam = Workspace.CurrentCamera
+            if cam then table.insert(exclude, cam) end
+            local char = currentCharacter()
+            if char then table.insert(exclude, char) end
+        end)
+        local positions, impact = simulateTrajectory(
+            muzzlePos, muzzleDir, speed,
+            resolved.entry.RicochetAngle or 80, exclude, resolved.entry
+        )
+        BS.Infantry.lastTrajectory = positions
+        BS.Infantry.lastImpact = impact
+        BS.Infantry.lastShell = resolved.entry
+        BS.Infantry.lastMuzzlePos = muzzlePos
+        BS.Infantry.lastMuzzleDir = muzzleDir
+        BS.Infantry.lastSpeed = speed
+        BS.Infantry.lastAt = now
+    end
+
+    if draw then
+        renderBulletLine(BS.Infantry.lastTrajectory, BS.Infantry.LINE_COLOR)
+
+        BS.Infantry.active = 1
+    elseif BS.Infantry.active > 0 then
+        hideExcessBulletParts(1)
+        BS.Infantry.active = 0
+    end
+end
+
+function BS.Infantry.aimHit(camera, resolved)
+    local exclude = {}
+    pcall(function()
+        local cam = Workspace.CurrentCamera
+        if cam then table.insert(exclude, cam) end
+        local char = currentCharacter()
+        if char then table.insert(exclude, char) end
+    end)
+    local params = RaycastParams.new()
+    params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = exclude
+    params.IgnoreWater = false
+    local ray = Workspace:Raycast(camera.CFrame.Position, camera.CFrame.LookVector * BS.Infantry.MAX_AIM_DIST, params)
+    if not ray then
+        return nil, nil
+    end
+    local origin = BS.Infantry.muzzleCFrame(camera).Position
+    local offset = ray.Position - origin
+    local d = offset.Magnitude
+    if d < 0.01 then
+        d = 0.01
+    end
+    local hit = {
+        part = ray.Instance,
+        position = ray.Position,
+        normal = ray.Normal,
+        distanceStuds = d,
+        speed = resolved.entry.MuzzleSpeed,
+        direction = offset / d,
+    }
+    return resolved.entry, hit
+end
+
+function BS.Infantry.footTick(camera, penNeedsSim)
+    if owner.stopped or not camera then
+        return
+    end
+    local wantLine = cfg.bulletLine == true
+    local wantSim = wantLine or penNeedsSim == true
+    if not wantSim then
+        BS.Infantry.clearLine()
+        return
+    end
+    local char = currentCharacter()
+    local tool = char and char:FindFirstChildOfClass("Tool")
+    local resolved = tool and BS.Infantry.resolve(tool) or nil
+    if resolved then
+
+        BS.Infantry.updateLine(camera, resolved, wantLine and BS.Infantry.isLineClass(resolved.entry))
+    else
+        BS.Infantry.clearLine()
+    end
+end
+
+function BS.Infantry.clearCache()
+    BS.Infantry.clearLine()
+    table.clear(BS.Infantry.cache)
+end
+
+owner.infantry = BS.Infantry
 local PEN_MAX_AIM_DIST = 6000
 
 local PS = {
@@ -4184,17 +4405,34 @@ function PS.isUnarmoredProp(part)
 end
 
 processPenIndicator = function(camera, localVehicle)
-    if not cfg.penIndicator or not localVehicle then
+    if not cfg.penIndicator then
         hidePenIndicator()
         return
     end
 
     local shell, hit
-    if cfg.penMode == "aim" then
-        shell, hit = evaluateAimRay(camera, localVehicle)
+    if localVehicle then
+        if cfg.penMode == "aim" then
+            shell, hit = evaluateAimRay(camera, localVehicle)
+        else
+
+            shell, hit = BulletLastShell, BulletLastImpact
+        end
     else
 
-        shell, hit = BulletLastShell, BulletLastImpact
+        local infantry = rawget(owner, "infantry")
+        local char = currentCharacter()
+        local tool = char and char:FindFirstChildOfClass("Tool")
+        local resolved = (infantry and tool) and infantry.resolve(tool) or nil
+        if not resolved then
+            hidePenIndicator()
+            return
+        end
+        if cfg.penMode == "aim" then
+            shell, hit = infantry.aimHit(camera, resolved)
+        else
+            shell, hit = infantry.lastShell, infantry.lastImpact
+        end
     end
     if not shell or not hit then
         hidePenIndicator()
@@ -4446,7 +4684,10 @@ local function refresh()
     end
 
     if cfg.bulletLine and localVehicle == nil and (BulletLineActive > 0 or BulletLastTrajectory ~= nil) then
-        clearBulletLines()
+        local inf = rawget(owner, "infantry")
+        if not (inf and inf.active and inf.active > 0) then
+            clearBulletLines()
+        end
     end
 end
 
@@ -4473,10 +4714,18 @@ local function bulletTick(deltaTime)
     local vehiclesFolder = Workspace:FindFirstChild("SpawnedVehicles")
     local localVehicle = playerVehicle(localHumanoid, vehiclesFolder)
     if not localVehicle then
-        if BulletLineActive > 0 or BulletLastTrajectory ~= nil then
+
+        local infantry = rawget(owner, "infantry")
+        local infHoldsPool = infantry and infantry.active and infantry.active > 0
+        if not infHoldsPool and (BulletLineActive > 0 or BulletLastTrajectory ~= nil) then
             clearBulletLines()
         end
-        hidePenIndicator()
+
+        if type(infantry) == "table" and type(infantry.footTick) == "function" then
+            local penNeedsSim = cfg.penIndicator == true and cfg.penMode == "impact"
+            pcall(infantry.footTick, camera, penNeedsSim)
+        end
+        pcall(processPenIndicator, camera, nil)
         return
     end
     local origin = distanceOrigin(camera, localCharacter)
@@ -4642,7 +4891,9 @@ local function initialize()
             name = "Vision",
             showName = "Vision",
 
-            showIcon = VISION_ICON_ID ~= 0 and ("rbxassetid://" .. VISION_ICON_ID) or nil,
+            showIcon = VISION_ICON_ID ~= 0
+                and ("rbxthumb://type=Asset&id=" .. VISION_ICON_ID .. "&w=420&h=420")
+                or nil,
             theme = VISION_THEME,
             configuration = {
                 autoSave = true,
@@ -4844,16 +5095,16 @@ local function initialize()
         end
     end
 
-    local mouseTab = ownedCall("mouseaim-tab", function()
-        return window:CreateTab({ name = "MouseAim" })
+    local crewTab = ownedCall("crew-tab", function()
+        return window:CreateTab({ name = "Crew" })
     end)
 
     ownedCall("mouseaim-section", function()
-        return mouseTab:CreateSection({ name = "Unlock MouseAim (Method A)" })
+        return crewTab:CreateSection({ name = "Gunner" })
     end)
 
     ownedCall("mouseaim-toggle", function()
-        return mouseTab:CreateToggle({
+        return crewTab:CreateToggle({
             name = "Unlock MouseAim",
             hint = "Solo fallback: TurretInfo.MouseAim or Solo → Enabled. Re-enter the Gunner seat after enabling to rebind.",
             flag = "V3MouseAimUnlock",
@@ -4892,7 +5143,7 @@ local function initialize()
     end)
 
     ownedCall("mouseaim-keybind", function()
-        return mouseTab:CreateKeybind({
+        return crewTab:CreateKeybind({
             name = "Toggle MouseAim",
             value = Enum.KeyCode.J,
             forgetState = true,
@@ -4934,17 +5185,13 @@ local function initialize()
         })
     end)
 
-    local reloadTab = ownedCall("reload-tab", function()
-        return window:CreateTab({ name = "Reload" })
-    end)
-
     ownedCall("reload-section", function()
-        return reloadTab:CreateSection({ name = "Quick Reload Assist" })
+        return crewTab:CreateSection({ name = "Loader" })
     end)
 
     ownedCall("reload-assist-toggle", function()
         local element = nil
-        element = reloadTab:CreateToggle({
+        element = crewTab:CreateToggle({
             name = "Auto Quick Reload",
             hint = "Arms while waiting for the loader minigame; uses its own callback only after verification.",
 
@@ -5300,7 +5547,8 @@ local function initialize()
     end)
 
     ownedCall("bulletline-section", function()
-        return tab:CreateSection({ name = "Bullet Line" })
+
+        return tab:CreateSection({ name = "Ballistics" })
     end)
     local bulletLineRow = ownedCall("bulletline-row", function()
         return tab:CreateGroup({ direction = "row" })
@@ -5530,7 +5778,15 @@ local function initialize()
     end)
 
     ownedCall("community-section", function()
-        return settingsTab:CreateSection({ name = "Community" })
+        return settingsTab:CreateSection({ name = "About" })
+    end)
+    ownedCall("version-stat", function()
+
+        return settingsTab:CreateStat({
+            name = "Version",
+            value = "Unreleased",
+            compact = true,
+        })
     end)
     ownedCall("discord-button", function()
         local invite = "https://discord.gg/4p4B2wyTm"
