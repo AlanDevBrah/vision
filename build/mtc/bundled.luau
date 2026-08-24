@@ -5784,7 +5784,7 @@ local function initialize()
 
         return settingsTab:CreateStat({
             name = "Version",
-            value = "Unreleased",
+            value = "v1.0.0",
             compact = true,
         })
     end)
