@@ -30,4 +30,8 @@ if not fn then
     return
 end
 
-fn()
+local runOk, runErr = pcall(fn)
+if not runOk then
+    fail("Startup failed: " .. tostring(runErr))
+    return
+end

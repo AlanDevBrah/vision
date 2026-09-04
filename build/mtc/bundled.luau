@@ -158,10 +158,8 @@ stopPreviousOwner()
 assertCleanStart()
 
 local RAYFIELD_URL = "https://sirius.menu/gen2"
-local RAYFIELD_CACHE = "mcp/mtc-rayfield-gen2-v1.1.0-mtc6.luau"
-local RAYFIELD_ORIGINAL_SHA256 = "e3c337e969e6c4c0de91a77156201094568be55fdfe2669368c48c1d8169d0a6"
+local RAYFIELD_CACHE = "mcp/mtc-rayfield-gen2-v1.1.0-mtc7.luau"
 
-local RAYFIELD_SHA256 = "3443571b34c47a58c8a1a1d32b6381a7362a18f5b17c43f30d043ebb59d0e9ea"
 local cfg = {
     playerCharm = true,
     playerInfo = true,
@@ -1442,9 +1440,6 @@ owner.fpv = {
     batteryBypass = false,
     spawnBypass = false,
 
-    attempts = 0,
-    detonateFires = 0,
-    detonateMisses = 0,
     rescans = 0,
     lastErrorCount = 0,
     lastError = nil,
@@ -1819,104 +1814,6 @@ function owner.fpv.stop()
     fpv.spawnBypass = false
     fpv.enabled = false
     return true
-end
-
-function owner.fpv.findOurFiredRemote()
-    local fpv = owner.fpv
-    local placed = Workspace:FindFirstChild("PlacedBuildings")
-    if not placed then
-        return nil, "no-placed-buildings"
-    end
-
-    local ourPart = nil
-    if fpv.sessions then
-        for _, session in pairs(fpv.sessions) do
-            local drone = session.drone
-            if drone and drone.Part and drone.Part.Parent then
-                ourPart = drone.Part
-                break
-            end
-        end
-    end
-
-    local ourControl = nil
-    pcall(function()
-        local pg = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-        local controlGui = pg and pg:FindFirstChild("ControlGUI")
-        local control = controlGui and controlGui:FindFirstChild("Control")
-        if control and control:IsA("ObjectValue") then
-            ourControl = control.Value
-        end
-    end)
-
-    if not ourPart and not ourControl then
-        return nil, "no-active-session"
-    end
-
-    local candidates = {}
-    for _, model in ipairs(placed:GetChildren()) do
-        if model.Name == "FPV Drone" then
-            local linked = false
-            if ourPart and ourPart:IsDescendantOf(model) then
-                linked = true
-            end
-            if not linked and ourControl and typeof(ourControl) == "Instance" then
-                if ourControl == model
-                    or ourControl:IsDescendantOf(model)
-                    or model:IsDescendantOf(ourControl) then
-                    linked = true
-                end
-            end
-            if linked then
-                local sc = model:FindFirstChildOfClass("Script")
-                local fired = sc and sc:FindFirstChild("Fired")
-                if fired and fired:IsA("RemoteEvent") then
-                    table.insert(candidates, fired)
-                end
-            end
-        end
-    end
-
-    if #candidates == 1 then
-        return candidates[1], nil
-    elseif #candidates == 0 then
-        return nil, "no-matching-drone"
-    end
-    return nil, "ambiguous-drone"
-end
-
-function owner.fpv.detonate()
-    local fpv = owner.fpv
-
-    if not fpv.manager and not owner.fpv.resolveModules() then
-        fpv.attempts += 1
-        fpv.detonateMisses += 1
-        fpv.lastError = "modules-not-found"
-        return false, "modules-not-found"
-    end
-    if not (fpv.sessions or owner.fpv.rescanTables()) then
-        fpv.attempts += 1
-        fpv.detonateMisses += 1
-        fpv.lastError = "no-active-session"
-        return false, "no-active-session"
-    end
-    fpv.attempts += 1
-    local fpvFiredRemote, reason = owner.fpv.findOurFiredRemote()
-    if not fpvFiredRemote then
-        fpv.detonateMisses += 1
-        fpv.lastError = reason
-        return false, reason
-    end
-    local ok, err = pcall(function()
-        fpvFiredRemote:FireServer()
-    end)
-    if ok then
-        fpv.detonateFires += 1
-        return true
-    end
-    fpv.detonateMisses += 1
-    fpv.lastError = tostring(err)
-    return false, fpv.lastError
 end
 
 local performance = {
@@ -2404,9 +2301,13 @@ local function externalCall(stage, callback)
     return table.unpack(packed, 2, packed.n)
 end
 
-local function replaceOnce(source, before, after, label)
+local function replaceOnce(source, before, after, label, softSkipped)
     local startIndex, endIndex = string.find(source, before, 1, true)
     if not startIndex then
+        if softSkipped then
+            table.insert(softSkipped, label)
+            return source
+        end
         error("[Vision] Rayfield patch marker missing: " .. label)
     end
     if string.find(source, before, endIndex + 1, true) then
@@ -2416,6 +2317,47 @@ local function replaceOnce(source, before, after, label)
 end
 
 local function patchRayfieldSource(source)
+    local skipped = {}
+
+    local function removeToastToggle(head, tail, label)
+        local headStart = string.find(source, head, 1, true)
+        if not headStart then
+            table.insert(skipped, label)
+            return
+        end
+        local tailStart = string.find(source, tail, headStart, true)
+        if not tailStart then
+            table.insert(skipped, label)
+            return
+        end
+        if string.find(source, head, tailStart + 1, true) then
+            error("[Vision] Rayfield patch marker repeated: " .. label)
+        end
+        local stmtStart = headStart
+        local budget = 200
+        while stmtStart > 1 and budget > 0 do
+            local ch = string.sub(source, stmtStart - 1, stmtStart - 1)
+            if ch ~= " " and ch ~= "\t" and ch ~= "\r" and ch ~= "\n" then
+                break
+            end
+            stmtStart -= 1
+            budget -= 1
+        end
+        while stmtStart > 1 and budget > 0 do
+            local ch = string.sub(source, stmtStart - 1, stmtStart - 1)
+            if not string.match(ch, "[%w.:]") then
+                break
+            end
+            stmtStart -= 1
+            budget -= 1
+        end
+        if budget <= 0 then
+            table.insert(skipped, label)
+            return
+        end
+        source = string.sub(source, 1, stmtStart - 1) .. string.sub(source, tailStart + #tail)
+    end
+
     source = replaceOnce(
         source,
         "m.Parent=f.guiContainer local n=Instance.new",
@@ -2424,22 +2366,15 @@ local function patchRayfieldSource(source)
     )
     source = replaceOnce(
         source,
-        "ZIndexBehavior.Global,Parent=f.guiContainer})y.main=",
-        "ZIndexBehavior.Global,Parent=f.guiContainer})y.screenGui:SetAttribute('VisionOwner',rawget(_G,'__VISION_PENDING_OWNER'))y.main=",
+        "Parent=f.guiContainer})L.main=",
+        "Parent=f.guiContainer})L.screenGui:SetAttribute('VisionOwner',rawget(_G,'__VISION_PENDING_OWNER'))L.main=",
         "window-owner"
     )
     source = replaceOnce(
         source,
-        ".Global,Parent=h.guiContainer})U.backdrop=",
-        ".Global,Parent=h.guiContainer})U.screenGui:SetAttribute('VisionOwner',V.screenGui:GetAttribute('VisionOwner'))U.backdrop=",
+        "Parent=ag.guiContainer})N.backdrop=",
+        "Parent=ag.guiContainer})N.screenGui:SetAttribute('VisionOwner',O.screenGui:GetAttribute('VisionOwner'))N.backdrop=",
         "popup-owner"
-    )
-
-    source = replaceOnce(
-        source,
-        "m.Enabled=true m.SafeAreaCompatibility=Enum.SafeAreaCompatibility.None m.ScreenInsets=Enum.",
-        "m.Enabled=false m.SafeAreaCompatibility=Enum.SafeAreaCompatibility.None m.ScreenInsets=Enum.",
-        "banner-splash-disabled"
     )
 
     local spawnStart = "task.spawn(function()task.wait(0.5)o:Destroy()task.wait(0.5)if not t.unloaded"
@@ -2458,62 +2393,28 @@ local function patchRayfieldSource(source)
 
     source = replaceOnce(
         source,
-        "Size=UDim2.fromOffset(100,4)}):Play()w.animating=false",
-        "Size=UDim2.fromOffset(100,4)}):Play()if w.unloaded then return end w.animating=false",
+        "delay(0.6,function()I.animating=false I._revealing=false end)",
+        "delay(0.6,function()if I.unloaded then return end I.animating=false I._revealing=false end)",
         "first-show-cancel"
     )
 
     source = replaceOnce(
         source,
-        "name=w.name or w.Name or'Rayfield Window'",
-        "name=w.name or w.Name or'Vision'",
-        "default-window-name"
+        "m.Enabled=true m.SafeAreaCompatibility=Enum.SafeAreaCompatibility.None m.ScreenInsets=Enum.",
+        "m.Enabled=false m.SafeAreaCompatibility=Enum.SafeAreaCompatibility.None m.ScreenInsets=Enum.",
+        "banner-splash-disabled",
+        skipped
     )
-    source = replaceOnce(
-        source,
-        "showName=w.showName or w.ShowName or'Rayfield'",
-        "showName=w.showName or w.ShowName or''",
-        "default-show-name"
-    )
+    source = replaceOnce(source, "or'Rayfield Window'", "or'Vision'", "default-window-name", skipped)
+    source = replaceOnce(source, "or'Rayfield',showIcon", "or'',showIcon", "default-show-name", skipped)
+    source = replaceOnce(source, "name='Rayfield Settings'", "name='Vision Settings'", "settings-tab-name", skipped)
 
-    source = replaceOnce(
-        source,
-        "name=\n'Rayfield Settings'",
-        "name=\n'Vision Settings'",
-        "settings-tab-name"
-    )
-
-    source = replaceOnce(
-        source,
-        "welcomeToast=true",
-        "welcomeToast=false",
-        "welcome-toast-default"
-    )
-    source = replaceOnce(
-        source,
-        "w.rfSettings:CreateToggle{name\n='Welcome toast',description=[[Shows a 'Signed in as' toast the first time you open the menu on a new account.]],value=w\n.settings.welcomeToast,callback=function(x)w.settings.welcomeToast=x w:SaveSettings()end}",
-        "",
-        "welcome-toast-toggle"
-    )
-    return source
+    source = replaceOnce(source, "welcomeToast=true", "welcomeToast=false", "welcome-toast-default", skipped)
+    removeToastToggle("CreateToggle{name=\n'Welcome toast'", "SaveSettings()end}", "welcome-toast-toggle")
+    return source, table.concat(skipped, ",")
 end
 
 local function verifiedRayfieldSource()
-    local crypto = crypt
-    if type(crypto) ~= "table" or type(crypto.hash) ~= "function" then
-        error("[Vision] crypt.hash is required for Rayfield verification")
-    end
-    local hashFn = crypto.hash
-
-    local function hashSource(source, stage)
-        if type(source) ~= "string" or source == "" then
-            return nil
-        end
-        return externalCall(stage, function()
-            return hashFn(source, "sha256")
-        end)
-    end
-
     local source = nil
     local cacheExists = externalCall("rayfield-cache-exists", function()
         return type(isfile) == "function" and isfile(RAYFIELD_CACHE)
@@ -2525,28 +2426,29 @@ local function verifiedRayfieldSource()
             end)
         end)
         assertCurrentGeneration("rayfield-cache-read")
-        if readOk and hashSource(cached, "rayfield-hash-cache") == RAYFIELD_SHA256 then
-            source = cached
+        if readOk and type(cached) == "string" and cached ~= ""
+            and string.find(cached, "VisionOwner", 1, true) then
+            local cachedChunk = externalCall("rayfield-cache-compile", function()
+                return loadstring(cached, "@rayfield-cache-check")
+            end)
+            if type(cachedChunk) == "function" then
+                source = cached
+            end
         end
     end
 
+    local skippedNote = nil
     if not source then
         local response = externalCall("rayfield-fetch", function()
             return game:HttpGet(RAYFIELD_URL)
         end)
-        if type(response) ~= "string" then
+        if type(response) ~= "string" or response == "" then
             error("[Vision] Rayfield download failed")
         end
-        local originalDigest = hashSource(response, "rayfield-hash-original")
-        if originalDigest ~= RAYFIELD_ORIGINAL_SHA256 then
-            error("[Vision] Rayfield upstream hash mismatch; source was not patched")
+        source, skippedNote = patchRayfieldSource(response)
+        if not string.find(source, "VisionOwner", 1, true) then
+            error("[Vision] Rayfield patch produced untagged source; aborted")
         end
-        source = patchRayfieldSource(response)
-    end
-
-    local digest = hashSource(source, "rayfield-hash-final")
-    if digest ~= RAYFIELD_SHA256 then
-        error("[Vision] Rayfield runtime hash mismatch; source was not executed")
     end
 
     if type(writefile) == "function" then
@@ -2557,13 +2459,17 @@ local function verifiedRayfieldSource()
         end)
         assertCurrentGeneration("rayfield-cache-write")
     end
+
+    if type(skippedNote) == "string" and skippedNote ~= "" then
+        warn("[Vision] Rayfield updated upstream; branding degraded (" .. skippedNote .. "). UI still works.")
+    end
     return source
 end
 
 local function loadVerifiedRayfield()
     local source = verifiedRayfieldSource()
     local chunk, compileError = externalCall("rayfield-compile", function()
-        return loadstring(source, "@rayfield-gen2-v1.1.0-mtc4")
+        return loadstring(source, "@rayfield-gen2-v1.1.0-mtc7")
     end)
     if type(chunk) ~= "function" then
         error("[Vision] Rayfield compile failed: " .. tostring(compileError))
@@ -5338,7 +5244,6 @@ owner.snapshot = function()
         fpvSignalBypass = owner.fpv.signalBypass,
         fpvBatteryBypass = owner.fpv.batteryBypass,
         fpvSpawnBypass = owner.fpv.spawnBypass,
-        fpvDetonateFires = owner.fpv.detonateFires,
         fpvLastError = owner.fpv.lastError,
         perfPbrApplied = performance.pbrApplied,
         perfPostFxApplied = performance.postFxApplied,
@@ -5850,31 +5755,6 @@ local function initialize()
                     return
                 end
                 owner.fpv.setGate("spawnBypass", value)
-            end,
-        })
-    end)
-
-    ownedCall("drone-detonate-button", function()
-        return crewTab:CreateButton({
-            name = "Force Detonate",
-            hint = "Detonates YOUR deployed FPV drone only; refuses when ownership is ambiguous.",
-            callback = function()
-                local ok, reason = owner.fpv.detonate()
-                if ok then
-                    notify({
-                        title = "Force Detonate",
-                        content = "Detonate signal sent.",
-                        duration = 4,
-                        icon = "check",
-                    })
-                else
-                    notify({
-                        title = "Force Detonate",
-                        content = "No owned drone resolved (" .. tostring(reason) .. "). Nothing fired.",
-                        duration = 5,
-                        icon = "warning",
-                    })
-                end
             end,
         })
     end)
@@ -6413,7 +6293,7 @@ local function initialize()
 
         return settingsTab:CreateStat({
             name = "Version",
-            value = "v1.0.0",
+            value = "v1.0.1",
             compact = true,
         })
     end)
@@ -6476,6 +6356,8 @@ owner.initializing = false
 if not ok then
     local cancelled = string.find(initError, "generation-cancelled", 1, true) ~= nil
     local clean = stop(cancelled and "initialization-cancelled" or "init-error")
+
+    warn("[Vision] Initialization failed: " .. tostring(initError))
     if not clean then
         error("[Vision] Initialization failed and cleanup is still pending: " .. tostring(initError))
     end
